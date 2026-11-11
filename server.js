@@ -1,13 +1,13 @@
-// FNF V-Slice Multiplayer relay server
-// Usage: node server.js        (PORT env var optional, default 8080)
-// No dependencies. Rooms live in memory; restarting the server closes all rooms.
 
 const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 const START_DELAY_MS = 3000;
 const ROOM_TTL_MS = 10 * 60 * 1000;
-const DISCONNECT_MS = 15 * 1000;
+const DISCONNECT_MS = (+process.env.T_DISC) || 15 * 1000;
+const LIST_STALE_MS = (+process.env.T_STALE) || 30 * 1000;
+const DEAD_LOBBY_MS = 90 * 1000;
+const VERSION = 3;
 const ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ';
 
 const rooms = new Map();
@@ -24,6 +24,24 @@ function makeCode() {
 function cleanName(n) {
   n = String(n || 'PLAYER').toUpperCase().replace(/[^A-Z0-9 ]/g, '').trim().slice(0, 12);
   return n.length ? n : 'PLAYER';
+}
+
+function guestGone(r) {
+  const g = r.players.p2;
+  return !!g && Date.now() - g.last >= DISCONNECT_MS && r.status === 'lobby';
+}
+
+function listOpen() {
+  const now = Date.now();
+  const open = [];
+  for (const r of rooms.values()) {
+    const h = r.players.p1;
+    if (!h || r.status !== 'lobby' || now - h.last >= LIST_STALE_MS) continue;
+    if (r.players.p2 && !guestGone(r)) continue;
+    open.push({ code: r.code, host: h.name, song: r.song, diff: r.diff, created: r.created });
+  }
+  open.sort((a, b) => b.created - a.created);
+  return open.slice(0, 50);
 }
 
 function snapshotPlayer(p) {
@@ -85,10 +103,15 @@ function handle(path, body, res) {
     return reply(res, { ok: true, pid: 'p1', room: snapshot(r) });
   }
 
+  if (path === '/list') {
+    return reply(res, { ok: true, rooms: listOpen() });
+  }
+
   if (path === '/join') {
     const r = rooms.get(String(body.room || '').toUpperCase());
     if (!r) return fail(res, 'ROOM NOT FOUND');
-    if (r.players.p2) return fail(res, 'ROOM IS FULL');
+    if (r.players.p2 && !guestGone(r)) return fail(res, 'ROOM IS FULL');
+    r.players.p1.ready = false;
     r.players.p2 = { name: cleanName(body.name), ready: false, hasSong: true, last: Date.now() };
     r.inbox.p2 = [];
     r.last = Date.now();
@@ -168,7 +191,10 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
   if (req.method === 'GET') {
-    return reply(res, { ok: true, rooms: rooms.size });
+    const path = req.url.split('?')[0];
+    if (path === '/list') return reply(res, { ok: true, rooms: listOpen() });
+    // health check: "rooms" = rooms held in memory, "open" = rooms a guest can actually see/join
+    return reply(res, { ok: true, v: VERSION, rooms: rooms.size, open: listOpen().length });
   }
   if (req.method !== 'POST') {
     res.writeHead(405);
@@ -199,7 +225,9 @@ const server = http.createServer((req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [code, r] of rooms) {
-    if (now - r.last > ROOM_TTL_MS) rooms.delete(code);
+    if (now - r.last > ROOM_TTL_MS) { rooms.delete(code); continue; }
+    const h = r.players.p1;
+    if (r.status === 'lobby' && h && now - h.last > DEAD_LOBBY_MS) rooms.delete(code);
   }
 }, 60 * 1000);
 
